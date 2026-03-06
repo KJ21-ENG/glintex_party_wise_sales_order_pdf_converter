@@ -15,6 +15,129 @@ const formatWeight = (val) => {
     return `${formatted} KG`;
 };
 
+// Column definitions (index-keyed)
+const COL_HEADERS = ['Date', 'Order', 'Item Name', 'Ordered', 'Balance', 'Rate', 'Value', 'Due On', 'Overdue'];
+const ITEM_NAME_COL = 2;
+const MIN_FONT_SIZE = 6;
+const BASE_FONT_SIZE = 8;
+const CELL_PADDING = 3; // 2 × 1.5mm
+
+/**
+ * Measures text width in mm for a given font size.
+ */
+const measureTextWidth = (doc, text, fontSize) => {
+    return doc.getStringUnitWidth(String(text)) * fontSize / doc.internal.scaleFactor;
+};
+
+/**
+ * Calculates optimal column widths and font sizes based on actual data.
+ * Returns { columns, fontSize, itemNameFontSize }
+ */
+const calculateColumnLayout = (doc, allOrders, availableWidth) => {
+    // Collect max text per column from all data + headers
+    const maxTexts = COL_HEADERS.map(h => h);
+
+    // Build formatted cell values for each column
+    const colTexts = COL_HEADERS.map(() => []);
+    COL_HEADERS.forEach((h, i) => colTexts[i].push(h));
+
+    allOrders.forEach(order => {
+        const row = [
+            order.date,
+            order.orderNo,
+            order.itemName,
+            formatWeight(order.orderedQty),
+            formatWeight(order.balanceQty),
+            formatCurrency(order.rate),
+            formatCurrency(order.value),
+            order.dueOn,
+            order.overdue
+        ];
+        row.forEach((val, i) => colTexts[i].push(String(val || '')));
+    });
+
+    // Find the longest text per column
+    colTexts.forEach((texts, i) => {
+        let longest = '';
+        texts.forEach(t => { if (t.length > longest.length) longest = t; });
+        maxTexts[i] = longest;
+    });
+
+    // Measure natural widths at base font size
+    doc.setFontSize(BASE_FONT_SIZE);
+    const naturalWidths = maxTexts.map(text => measureTextWidth(doc, text, BASE_FONT_SIZE) + CELL_PADDING);
+
+    // Minimum widths to keep columns readable
+    const minWidths = [18, 20, 30, 22, 22, 14, 20, 18, 20];
+
+    // Clamp natural widths to minimums
+    const clampedWidths = naturalWidths.map((w, i) => Math.max(w, minWidths[i]));
+
+    // Sum of all fixed columns (everything except Item Name)
+    const fixedColsWidth = clampedWidths.reduce((sum, w, i) => i === ITEM_NAME_COL ? sum : sum + w, 0);
+
+    // Give Item Name the remaining space
+    let itemNameWidth = availableWidth - fixedColsWidth;
+    let itemNameFontSize = BASE_FONT_SIZE;
+    let globalFontSize = BASE_FONT_SIZE;
+
+    const itemNameRequiredWidth = measureTextWidth(doc, maxTexts[ITEM_NAME_COL], BASE_FONT_SIZE) + CELL_PADDING;
+
+    if (itemNameWidth < itemNameRequiredWidth) {
+        // Try reducing item name font size
+        for (let fs = BASE_FONT_SIZE - 0.5; fs >= MIN_FONT_SIZE; fs -= 0.5) {
+            const needed = measureTextWidth(doc, maxTexts[ITEM_NAME_COL], fs) + CELL_PADDING;
+            if (needed <= itemNameWidth) {
+                itemNameFontSize = fs;
+                break;
+            }
+            itemNameFontSize = fs;
+        }
+
+        // If still doesn't fit at min font, scale all columns down
+        const stillNeeded = measureTextWidth(doc, maxTexts[ITEM_NAME_COL], itemNameFontSize) + CELL_PADDING;
+        if (stillNeeded > itemNameWidth) {
+            for (let fs = BASE_FONT_SIZE - 0.5; fs >= MIN_FONT_SIZE; fs -= 0.5) {
+                const scaledFixed = clampedWidths.reduce((sum, w, i) => {
+                    if (i === ITEM_NAME_COL) return sum;
+                    const scaled = measureTextWidth(doc, maxTexts[i], fs) + CELL_PADDING;
+                    return sum + Math.max(scaled, minWidths[i] * (fs / BASE_FONT_SIZE));
+                }, 0);
+                const remaining = availableWidth - scaledFixed;
+                const itemNeeded = measureTextWidth(doc, maxTexts[ITEM_NAME_COL], fs) + CELL_PADDING;
+                if (itemNeeded <= remaining) {
+                    globalFontSize = fs;
+                    itemNameFontSize = fs;
+                    // Recalculate fixed widths at new font size
+                    clampedWidths.forEach((_, i) => {
+                        if (i !== ITEM_NAME_COL) {
+                            const scaled = measureTextWidth(doc, maxTexts[i], fs) + CELL_PADDING;
+                            clampedWidths[i] = Math.max(scaled, minWidths[i] * (fs / BASE_FONT_SIZE));
+                        }
+                    });
+                    const newFixedTotal = clampedWidths.reduce((sum, w, i) => i === ITEM_NAME_COL ? sum : sum + w, 0);
+                    itemNameWidth = availableWidth - newFixedTotal;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Ensure item name width has a reasonable minimum
+    itemNameWidth = Math.max(itemNameWidth, minWidths[ITEM_NAME_COL]);
+
+    // Build final columns array
+    const finalWidths = clampedWidths.map((w, i) => i === ITEM_NAME_COL ? itemNameWidth : w);
+
+    const columns = COL_HEADERS.map((header, i) => ({
+        header,
+        width: finalWidths[i],
+        align: [3, 4, 5, 6].includes(i) ? 'right' : (i === ITEM_NAME_COL ? 'left' : 'center')
+    }));
+
+    return { columns, fontSize: globalFontSize, itemNameFontSize };
+};
+
 /**
  * Generates a Party-wise Sales Order PDF.
  * Optimized for compactness, single-line rows, and aligned totals.
@@ -66,19 +189,10 @@ export const generatePartyWisePDF = async (parsedData) => {
 
         let finalY = logoData ? 40 : 35;
 
-        // --- Explicit Column Configurations ---
-        // Total width = 269mm
-        const columns = [
-            { header: 'Date', width: 22 },      // 0: X=14
-            { header: 'Order', width: 26 },     // 1: X=36
-            { header: 'Item Name', width: 80 }, // 2: X=62
-            { header: 'Ordered', width: 26, align: 'right' },  // 3: X=142
-            { header: 'Balance', width: 26, align: 'right' },  // 4: X=168
-            { header: 'Rate', width: 18, align: 'right' },     // 5: X=194
-            { header: 'Value', width: 24, align: 'right' },    // 6: X=212
-            { header: 'Due On', width: 22 },    // 7: X=236
-            { header: 'Overdue', width: 25 }    // 8: X=258 -> Ends at 283 (Wait, 14+269=283)
-        ];
+        // --- Auto-fit Column Layout ---
+        const availableWidth = 269; // A4 landscape minus margins (297 - 14 - 14)
+        const allOrders = data.flatMap(group => group.orders);
+        const { columns, fontSize: calcFontSize, itemNameFontSize } = calculateColumnLayout(doc, allOrders, availableWidth);
 
         // Map configuration to jspdf-autotable styles
         const colStyles = {};
@@ -87,7 +201,7 @@ export const generatePartyWisePDF = async (parsedData) => {
                 cellWidth: col.width,
                 halign: col.align || 'center'
             };
-            if (i === 2) colStyles[i].halign = 'left'; // Item Name left
+            if (i === ITEM_NAME_COL) { colStyles[i].fontSize = itemNameFontSize; }
             if (i === 8) colStyles[i].textColor = [200, 50, 50]; // Overdue red
         });
 
@@ -157,7 +271,7 @@ export const generatePartyWisePDF = async (parsedData) => {
                 ],
                 theme: 'grid',
                 styles: {
-                    fontSize: 8,
+                    fontSize: calcFontSize,
                     cellPadding: 1.5,
                     overflow: 'ellipsize',
                     valign: 'middle',
@@ -211,7 +325,7 @@ export const generatePartyWisePDF = async (parsedData) => {
         const yText = finalY + 6.5;
 
         // Label: "GRAND TOTAL" (Spanning Date, Order, Item)
-        // Width = 22 + 26 + 80 = 128
+        // Width = 20 + 22 + 98 = 140
         // Align Right in this block
         doc.text("GRAND TOTAL", colX[3] - 4, yText, { align: 'right' });
 
