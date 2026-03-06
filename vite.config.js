@@ -5,7 +5,11 @@ import tailwindcss from '@tailwindcss/vite'
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: '/',
   plugins: [react(), tailwindcss()],
+  build: {
+    target: 'es2017',
+  },
   resolve: {
     alias: {
       "@": path.resolve(process.cwd(), "./src"),
